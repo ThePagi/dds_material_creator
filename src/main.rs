@@ -1,17 +1,20 @@
 use argh::FromArgs;
 use image::{io::Reader as ImageReader, DynamicImage};
-use image::{GenericImage, GenericImageView, ImageBuffer};
+use image::{GenericImage, GenericImageView, Rgba};
 use image_dds::ddsfile::Dds;
-use image_dds::{dds_from_image, dds_from_imagef32, ImageFormat};
+use image_dds::{dds_from_image, ImageFormat};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+// TODO: implement complex skin material (glossiness in G channel of specular map)
+
 #[derive(FromArgs)]
-/// Converts image files to Skyrim textures. The resulting textures are composed and named according to the Skyrim conventions.
+/// Converts image files to Skyrim textures. The resulting textures are composed and named according to the Skyrim conventions, mipmaps are generated.
 /// Input files are recognized by file names (without suffix) and all of them are optional:
-/// diffuse, normal, specular, glow, skin_tint, height, cubemap, env_mask, inner_diffuse, subsurface, backlight.
+/// diffuse, normal, specular, glow, skin_tint, height, cubemap, env_mask, inner_diffuse, inner_depth, subsurface, backlight, metallic, glossiness.
+/// All textures for which the required images are provided will be generated. Images that combine into one texture must have the same resolution!
 /// The common supported formats are png, tif, jpg and bmp.
 /// The textures used ingame depend on the meshes' property flags, just use the ones you need!
 /// For details on supported image formats look at the default features of the image crate (https://docs.rs/image).
@@ -31,7 +34,7 @@ struct Args {
     /// will write height information instead of transparency to the alpha channel of the diffuse texture. Used for parallax on landscape/terrain textures.
     pub terrain_parallax: bool,
     #[argh(switch, short = 'c')]
-    /// will write complex parallax information (R: env mask, G: glossy, B: metallic, A: height) into the environment map. Used for parallax on object textures.
+    /// will write complex parallax information (R: env_mask, G: glossiness, B: metallic, A: height) into the environment map. Used for parallax on object textures.
     pub complex_parallax: bool,
     #[argh(option, short = 'i')]
     /// specifies the input directory. By default the current working directory is used
@@ -59,8 +62,11 @@ struct InputImages {
     pub cubemap: Option<DynamicImage>,
     pub env_mask: Option<DynamicImage>,
     pub inner_diffuse: Option<DynamicImage>,
+    pub inner_depth: Option<DynamicImage>,
     pub subsurface: Option<DynamicImage>,
     pub backlight: Option<DynamicImage>,
+    pub metallic: Option<DynamicImage>,
+    pub glossiness: Option<DynamicImage>,
 }
 
 fn get_file_paths<P>(path: P) -> std::io::Result<HashMap<String, PathBuf>>
@@ -156,9 +162,7 @@ where
     }
 }
 
-fn create_textures(
-    images: InputImages, args: &Args
-) -> Vec<(&'static str, Dds)> {
+fn create_textures(images: InputImages, args: &Args) -> Vec<(&'static str, Dds)> {
     let mut textures = Vec::new();
 
     if let Some(tex) = create_diffuse(&images, args) {
@@ -167,17 +171,111 @@ fn create_textures(
     if let Some(tex) = create_normal(&images, args) {
         textures.push(("_n", tex));
     }
-    if let Some(tex) = create_specular(&images, args) {
+    if let Some(tex) = create_generic(&images.glow, ImageProps::RGB, args) {
+        textures.push(("_g", tex));
+    }
+    if let Some(tex) = create_generic(&images.skin_tint, ImageProps::RGB, args) {
+        textures.push(("_sk", tex));
+    }
+    if let Some(tex) = create_generic(&images.height, ImageProps::Grayscale, args) {
+        textures.push(("_p", tex));
+    }
+    if let Some(tex) = create_generic(&images.cubemap, ImageProps::Grayscale, args) {
+        textures.push(("_e", tex));
+    }
+    if args.complex_parallax {
+        if let Some(tex) = create_complex_parallax(&images, args) {
+            textures.push(("_m", tex));
+        }
+    } else if let Some(tex) = create_generic(&images.env_mask, ImageProps::Grayscale, args) {
+        textures.push(("_m", tex));
+    }
+    if let Some(tex) = create_inner(&images, args) {
+        textures.push(("_i", tex));
+    }
+    if let Some(tex) = create_generic(&images.subsurface, ImageProps::RGB, args) {
+        textures.push(("_subsurface", tex));
+    }
+    if let Some(tex) = create_generic(&images.specular, ImageProps::Grayscale, args) {
         textures.push(("_s", tex));
     }
-
+    if let Some(tex) = create_generic(&images.backlight, ImageProps::RGB, args) {
+        textures.push(("_b", tex));
+    }
     textures
 }
 
-fn create_specular(images: &InputImages, args: &Args) -> Option<Dds> {
-    if let Some(img) = &images.specular {
+fn create_complex_parallax(images: &InputImages, args: &Args) -> Option<Dds> {
+    let (w, h) = {
+        if let Some(img) = &images.env_mask{
+            (img.width(), img.height())
+        }
+        else if let Some(img) = &images.glossiness{
+            (img.width(), img.height())
+        }
+        else if let Some(img) = &images.metallic{
+            (img.width(), img.height())
+        }
+        else if let Some(img) = &images.height{
+            (img.width(), img.height())
+        }
+        else{
+            println!("Error: Complex parallax material selected, but none of the images (R: env_mask, G: glossiness, B: metallic, A: height) available!");
+            return None
+        }
+    };
+    let mut res = image::RgbaImage::new(w, h);
+    for y in 0..res.height() {
+        for x in 0..res.width() {
+            res.put_pixel(x, y, Rgba([0, 5, 0, 255]));
+        }
+    }
+    if let Some(img) = &images.env_mask{
+        for y in 0..img.height() {
+            for x in 0..img.width() {
+                let p = img.get_pixel(x, y);
+                res.get_pixel_mut(x, y).0[0] = p.0[0];
+            }
+        }
+    }
+    if let Some(img) = &images.glossiness{
+        for y in 0..img.height() {
+            for x in 0..img.width() {
+                let p = img.get_pixel(x, y);
+                res.get_pixel_mut(x, y).0[1] = p.0[0];
+            }
+        }
+    }
+    if let Some(img) = &images.metallic{
+        for y in 0..img.height() {
+            for x in 0..img.width() {
+                let p = img.get_pixel(x, y);
+                res.get_pixel_mut(x, y).0[2] = p.0[0];
+            }
+        }
+    }
+    if let Some(img) = &images.height{
+        for y in 0..img.height() {
+            for x in 0..img.width() {
+                let p = img.get_pixel(x, y);
+                res.get_pixel_mut(x, y).0[3] = p.0[0];
+            }
+        }
+    }
+    Some(
+        dds_from_image(
+            &res,
+            pick_format(ImageProps::RGBFullAlpha, args.archaic_format, args.high_quality),
+            image_dds::Quality::Slow,
+            image_dds::Mipmaps::GeneratedAutomatic,
+        )
+        .unwrap(),
+    )
+}
+
+fn create_generic(image: &Option<DynamicImage>, props: ImageProps, args: &Args) -> Option<Dds> {
+    if let Some(img) = image {
         let mut res = image::RgbaImage::new(img.width(), img.height());
-        let props = ImageProps::Grayscale;
         if let Err(e) = res.copy_from(img, 0, 0) {
             println!(
                 "Error: Cannot copy from diffuse image to rgba8 texture! {}",
@@ -187,6 +285,51 @@ fn create_specular(images: &InputImages, args: &Args) -> Option<Dds> {
             return None;
         }
         let format = pick_format(props, args.archaic_format, args.high_quality);
+        Some(
+            dds_from_image(
+                &res,
+                format,
+                image_dds::Quality::Slow,
+                image_dds::Mipmaps::GeneratedAutomatic,
+            )
+            .unwrap(),
+        )
+    } else {
+        None
+    }
+}
+
+fn create_inner(images: &InputImages, args: &Args) -> Option<Dds> {
+    if let Some(img) = &images.inner_diffuse {
+        let mut res = image::RgbaImage::new(img.width(), img.height());
+        let props = if images.inner_depth.is_some() {
+            ImageProps::RGBFullAlpha
+        } else if img.color().has_alpha() {
+            ImageProps::RGBFullAlpha
+        } else {
+            ImageProps::RGB
+        };
+        if let Err(e) = res.copy_from(img, 0, 0) {
+            println!(
+                "Error: Cannot copy from diffuse image to rgba8 texture! {}",
+                e
+            );
+            println!("The format: {:?}", img.color());
+            return None;
+        }
+        if let Some(depth) = &images.inner_depth {
+            for y in 0..depth.height() {
+                for x in 0..depth.width() {
+                    let p = depth.get_pixel(x, y);
+                    res.get_pixel_mut(x, y).0[3] = p.0[0]; // set inner_depth.r to result.a
+                }
+            }
+        }
+        let format = pick_format(
+            props,
+            args.archaic_format,
+            true, /* BC1 does badly with normal maps */
+        );
         Some(
             dds_from_image(
                 &res,
@@ -299,8 +442,8 @@ fn create_diffuse(images: &InputImages, args: &Args) -> Option<Dds> {
             println!("The format: {:?}", img.color());
             return None;
         }
-        if args.terrain_parallax{
-            if let Some(height) = &images.height{
+        if args.terrain_parallax {
+            if let Some(height) = &images.height {
                 props = ImageProps::RGBFullAlpha;
                 for y in 0..height.height() {
                     for x in 0..height.width() {
@@ -308,11 +451,9 @@ fn create_diffuse(images: &InputImages, args: &Args) -> Option<Dds> {
                         res.get_pixel_mut(x, y).0[3] = p.0[0]; // set height.r to result.a
                     }
                 }
-            }
-            else{
+            } else {
                 println!("Error: Terrain parallax selected, but no height image supplied!");
             }
-
         }
         let format = pick_format(props, args.archaic_format, args.high_quality);
         Some(
@@ -334,15 +475,22 @@ fn main() -> Result<(), Box<dyn Error>> {
     let dir = if let Some(p) = &args.input_dir {
         p.clone()
     } else {
-        std::env::current_dir()?
+        match std::env::current_dir() {
+            Ok(p) => p,
+            Err(e) => {
+                println!("Critical error, Cannot access the working directory: {}", e);
+                println!("You can set input directory with the -i flag.");
+                return Ok(());
+            }
+        }
     };
-    let hq = false;
-    let old_format = false;
-    let output_name = "mytex".to_owned();
     println!("Using input directory: {}", dir.display());
-    let fnames = get_file_paths(dir.as_path())?;
+    let fnames = match get_file_paths(dir.as_path()){
+        Ok(fnames) => fnames,
+        Err(e) => {println!("Critical error, cannot get file paths: {}", e); return Ok(())},
+    };
     let images = InputImages {
-        diffuse_alpha: load_input_image(fnames.get("diffuse")), 
+        diffuse_alpha: load_input_image(fnames.get("diffuse")),
         normal: load_input_image(fnames.get("normal")),
         specular: load_input_image(fnames.get("specular")),
         glow: load_input_image(fnames.get("glow")),
@@ -351,8 +499,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         cubemap: load_input_image(fnames.get("cubemap")),
         env_mask: load_input_image(fnames.get("env_mask")),
         inner_diffuse: load_input_image(fnames.get("inner_diffuse")),
+        inner_depth: load_input_image(fnames.get("inner_depth")),
         subsurface: load_input_image(fnames.get("subsurface")),
         backlight: load_input_image(fnames.get("backlight")),
+        metallic: load_input_image(fnames.get("metallic")),
+        glossiness: load_input_image(fnames.get("glossiness")),
     };
     let mut out_dir = if let Some(p) = &args.output_dir {
         p.clone()
@@ -367,10 +518,15 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let textures = create_textures(images, &args);
     for (suffix, tex) in textures {
-        let out_path = out_dir.join(output_name.clone() + suffix + ".dds");
+        let out_path = out_dir.join(args.name.clone() + suffix + ".dds");
         println!("Writing: {}", out_path.display());
-        let mut file = File::create(out_path)?;
-        tex.write(&mut file)?;
+        let mut file = match File::create(out_path){
+            Ok(f) => f,
+            Err(e) => {println!("Error, cannot create texture file at {}! {}", out_dir.display(), e); continue;},
+        };
+        if let Err(e) = tex.write(&mut file){
+            println!("Error, cannot write into texture file! {}", e);
+        }
     }
 
     Ok(())

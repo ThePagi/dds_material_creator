@@ -189,7 +189,7 @@ fn create_complex_parallax(images: &InputImages, args: &Args) -> Option<Dds> {
     let mut res = image::RgbaImage::new(w, h);
     for y in 0..res.height() {
         for x in 0..res.width() {
-            res.put_pixel(x, y, Rgba([0, 5, 0, 255]));
+            res.put_pixel(x, y, Rgba([0, 5, 0, 0]));
         }
     }
     if let Some(img) = &images.env_mask{
